@@ -38,6 +38,9 @@ from llm import (
     ModelConfig, GPTLanguageModel, set_seed,
     load_and_tokenize, get_batch, build_tokenizer, cross_entropy_loss
 )
+from tokenizer import BPETokenizer, CharTokenizer
+from data import clean_text, stream_jsonl, deduplicate, filter_by_length, build_datasets, get_batch_from_dataset
+from eval import compute_perplexity, compute_bpb, evaluate_model, evaluate_generation, save_eval_results
 
 
 # =====================================================================================
@@ -563,6 +566,21 @@ def main():
     parser.add_argument('--n-head', type=int, default=None)
     parser.add_argument('--block-size', type=int, default=None)
 
+    # M3: 分词器和数据
+    parser.add_argument('--tokenizer', type=str, default='char',
+                        choices=['char', 'bpe'],
+                        help='分词器类型 (char=字符级, bpe=BPE)')
+    parser.add_argument('--bpe-vocab', type=int, default=500,
+                        help='BPE 词表大小 (仅 BPE 分词器)')
+    parser.add_argument('--bpe-save', type=str, default=None,
+                        help='保存训练好的 BPE 分词器路径')
+    parser.add_argument('--eval-only', action='store_true',
+                        help='仅评测模式（不训练）')
+    parser.add_argument('--eval-prompts', type=str, default=None,
+                        help='评测 generation 的 prompt 文件路径')
+    parser.add_argument('--compare-tokenizers', action='store_true',
+                        help='对比字符级和 BPE 分词器')
+
     args = parser.parse_args()
 
     # ── 预设配置 ──
@@ -633,7 +651,7 @@ def main():
         log_file=str(Path(config.log_dir) / "train.log")
     )
     logger.info(f"{'='*60}")
-    logger.info(f" nanoGPT v0.5 (M2) — 训练工程化")
+    logger.info(f" nanoGPT v0.5 (M3 训练工程化)")
     logger.info(f"{'='*60}")
     logger.info(f"\n{config.summary()}")
 
@@ -645,23 +663,81 @@ def main():
         config.autocast_enabled = False
     logger.info(f"精度: {amp_status}")
     logger.info(f"SDPA: {'ON' if config.use_sdpa else 'OFF'}")
+    logger.info(f"分词器: {args.tokenizer}")
 
-    # ── 加载数据 ──
+    # ── 加载原始文本 ──
     logger.info(f"加载数据: {config.data_path}")
-    train_data, val_data, vocab_size = load_and_tokenize(config)
-    config.vocab_size = vocab_size
-    logger.info(f"词表大小: {vocab_size}，训练集: {len(train_data):,} 字符，"
-                f"验证集: {len(val_data):,} 字符")
+    with open(config.data_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    logger.info(f"原始文本: {len(text):,} 字符")
+
+    # ── 训练/加载分词器 ──
+    if args.tokenizer == 'bpe':
+        logger.info(f"训练 BPE 分词器 (vocab_size={args.bpe_vocab})...")
+        tokenizer = BPETokenizer.train(text, vocab_size=args.bpe_vocab)
+        logger.info(f"BPE 分词器: {tokenizer}")
+        if args.bpe_save:
+            tokenizer.save(args.bpe_save)
+            logger.info(f"  → 保存分词器: {args.bpe_save}")
+    else:
+        logger.info("使用字符级分词器...")
+        tokenizer = CharTokenizer.train(text)
+        logger.info(f"字符级分词器: {tokenizer}")
+
+    config.vocab_size = tokenizer.vocab_size
+
+    # ── 构建数据集 ──
+    # 文本已经分词，按 90/10 划分
+    logger.info("分词并构建数据集...")
+    # 将所有文档连成一条 token 序列
+    all_token_ids = tokenizer.encode(text)
+    
+    # 划分训练/验证
+    split = int(0.9 * len(all_token_ids))
+    train_token_ids = all_token_ids[:split]
+    val_token_ids = all_token_ids[split:]
+    
+    # 转为 Tensor
+    train_data = torch.tensor(train_token_ids, dtype=torch.long, device=config.device)
+    val_data = torch.tensor(val_token_ids, dtype=torch.long, device=config.device)
+    
+    logger.info(f"训练 token: {len(train_token_ids):,}, 验证 token: {len(val_token_ids):,}")
+    
+    # 构建索引化的验证集用于评测
+    from data import TokenizedDataset
+    val_dataset = TokenizedDataset(val_token_ids, config.block_size, name="val")
 
     # ── 构建模型 ──
     model = GPTLanguageModel(config)
     logger.info(f"实际参数量: {model.count_params() / 1e6:.2f}M")
 
+    # ── 评测模式 ──
+    if args.eval_only:
+        logger.info(f"\n{'='*60}")
+        logger.info(" 评测模式")
+        logger.info(f"{'='*60}")
+        
+        result = evaluate_model(model, val_dataset, batch_size=config.batch_size, 
+                               max_batches=20, device=config.device)
+        logger.info(f"评测结果: loss={result['loss']:.4f}, "
+                    f"ppl={result['perplexity']:.2f}, "
+                    f"bpb={result['bits_per_byte']:.4f}")
+        
+        # 生成测试
+        prompts = ["The ", "To be or", "All that"]
+        gen_result = evaluate_generation(model, tokenizer, prompts, 
+                                         max_new_tokens=50, device=config.device)
+        logger.info(f"生成多样性: {gen_result['avg_unique_token_ratio']:.4f}")
+        for g in gen_result['generations']:
+            logger.info(f"  '{g['prompt']}' → '{g['generated'][:60]}'")
+        
+        # 保存评测
+        eval_path = str(Path(config.log_dir) / "eval_results.json")
+        save_eval_results({'metrics': result, 'generation': gen_result}, eval_path)
+        return
+
     # ── 构建 Trainer ──
-    encode_fn, decode_fn, _ = build_tokenizer(
-        open(config.data_path, 'r', encoding='utf-8').read()
-    )
-    trainer = Trainer(model, config, train_data, val_data, decode_fn=decode_fn)
+    trainer = Trainer(model, config, train_data, val_data, decode_fn=lambda ids: tokenizer.decode(ids))
     trainer.logger = logger  # 统一 logger
 
     # ── 恢复训练 ──

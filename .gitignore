@@ -32,6 +32,8 @@ checkpoints/
 logs/
 wandb/
 *.log
+benchmark_results.json
+test_tmp/
 
 # OS
 .DS_Store
