@@ -1,0 +1,10 @@
+# nanoGPT dependencies
+# Install with: pip install -r requirements.txt
+#
+# For CUDA 13.0 (RTX 4050, driver 580.88):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu130
+# For CPU-only:
+#   pip install torch
+
+torch>=2.0
+numpy>=1.24
