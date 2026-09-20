@@ -28,8 +28,12 @@ build/
 # nanoGPT specific
 data/input.txt
 data/input.txt.tmp
+data/bin/
+data/*.bin
+data/*.json
 checkpoints/
 logs/
+runs/
 wandb/
 *.log
 benchmark_results.json

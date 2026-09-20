@@ -136,29 +136,44 @@ class BPETokenizer:
         return self._encode_small(text)
 
     def _encode_small(self, text: str) -> List[int]:
-        """小文本：原地修改 + 贪心最优合并"""
+        """小文本：每轮应用所有可合并位置（优先级最高的 merge）
+
+        原实现每轮只合并一个位置 → O(N² × M) 退化。
+        新实现：每轮一次扫描发现所有可合并的 pair，取优先级最高
+        (new_id 最小) 的应用全部 occurrences，再扫描下一轮。
+        每轮至少消除一种 merge 类型，最多 M 轮。O(M × N)。
+
+        对较长的输入按行分割，规避单段过长时行内 token 堆积。
+        """
         ids = list(text.encode('utf-8'))
 
-        while True:
-            best_pos = -1
-            best_pri = float('inf')
-            best_new_id = -1
+        # 长度兜底：长文本按行分割
+        if len(ids) > 20000:
+            lines = text.split('\n')
+            all_ids = []
+            for line in lines:
+                if line:
+                    all_ids.extend(self._encode_small(line))
+                all_ids.append(10)
+            if all_ids and all_ids[-1] == 10:
+                all_ids.pop()
+            return all_ids
 
+        # 主合并循环：扫描 → 选最优 pair → 应用全部 → 重复
+        while True:
+            # 一轮扫描：找 ids 中仍能出现在 merges 的 pair，记录其新 id
+            best_new_id = None
+            best_pair = None
             for i in range(len(ids) - 1):
                 pair = (ids[i], ids[i + 1])
                 if pair in self.merges:
-                    pri = self.merges[pair]
-                    if pri < best_pri:
-                        best_pri = pri
-                        best_pos = i
-                        best_new_id = pri
-
-            if best_pos < 0:
+                    new_id = self.merges[pair]
+                    if best_new_id is None or new_id < best_new_id:
+                        best_new_id = new_id
+                        best_pair = pair
+            if best_pair is None:
                 break
-
-            # 原地替换而非 list copy
-            ids[best_pos] = best_new_id
-            del ids[best_pos + 1]
+            ids = _merge(ids, best_pair, best_new_id)
 
         return ids
 

@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import torch
 from llm import ModelConfig, GPTLanguageModel, set_seed
 from tokenizer import BPETokenizer, CharTokenizer
-from data import TokenizedDataset
+from data.pipeline import TokenizedDataset
 from eval import compute_perplexity, compute_bpb, evaluate_model, save_eval_results
 from train import Trainer, setup_logger
 from llm import get_batch

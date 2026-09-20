@@ -20,7 +20,7 @@ from llm import ModelConfig, GPTLanguageModel, set_seed
 from tokenizer import BPETokenizer, CharTokenizer
 from eval import compute_perplexity, compute_bpb, evaluate_model, evaluate_generation, save_eval_results
 from train import Trainer, CheckpointManager, setup_logger
-from data import TokenizedDataset
+from data.pipeline import TokenizedDataset
 
 
 def main():

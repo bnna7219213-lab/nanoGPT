@@ -8,3 +8,7 @@
 
 torch>=2.0
 numpy>=1.24
+
+# M6 扩展数据（可选）
+# datasets>=2.0      # HuggingFace datasets，用于流式加载大型语料
+# tqdm>=4.60          # 进度条

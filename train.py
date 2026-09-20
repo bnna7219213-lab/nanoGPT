@@ -39,7 +39,7 @@ from llm import (
     load_and_tokenize, get_batch, build_tokenizer, cross_entropy_loss
 )
 from tokenizer import BPETokenizer, CharTokenizer
-from data import clean_text, stream_jsonl, deduplicate, filter_by_length, build_datasets, get_batch_from_dataset
+from data.pipeline import clean_text, stream_jsonl, deduplicate, filter_by_length, build_datasets, get_batch_from_dataset
 from eval import compute_perplexity, compute_bpb, evaluate_model, evaluate_generation, save_eval_results
 
 
@@ -704,7 +704,7 @@ def main():
     logger.info(f"训练 token: {len(train_token_ids):,}, 验证 token: {len(val_token_ids):,}")
     
     # 构建索引化的验证集用于评测
-    from data import TokenizedDataset
+    from data.pipeline import TokenizedDataset
     val_dataset = TokenizedDataset(val_token_ids, config.block_size, name="val")
 
     # ── 构建模型 ──
