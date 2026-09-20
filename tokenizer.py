@@ -115,8 +115,9 @@ class BPETokenizer:
     def encode(self, text: str) -> List[int]:
         """将文本编码为 token id 序列
 
-        使用迭代合并：每轮扫描所有当前 merges，找最高优先级的可合并对。
-        按照 merges 的 id 顺序（即训练时的优先级顺序）进行合并。
+        策略:
+        - 大文本 (>100KB): 按行分割后逐行编码（避免 O(n × merges) 全序列扫描）
+        - 小文本: 原地修改 + 单次最优合并
 
         Args:
             text: 输入文本
@@ -130,30 +131,48 @@ class BPETokenizer:
         if not text:
             return []
 
-        # 转为字节 ids
+        if len(text) > 100_000:
+            return self._encode_large(text)
+        return self._encode_small(text)
+
+    def _encode_small(self, text: str) -> List[int]:
+        """小文本：原地修改 + 贪心最优合并"""
         ids = list(text.encode('utf-8'))
 
-        # 迭代合并：每次找第一个可应用的 merge（按 merge id 顺序）
-        # merge id 越小 = 训练时优先级越高
-        changed = True
-        while changed:
-            changed = False
-            # 按 merge id 从小到大排序，第一个可应用的就是最优选择
-            best_pair = None
-            best_new_id = None
-            best_priority = float('inf')
+        while True:
+            best_pos = -1
+            best_pri = float('inf')
+            best_new_id = -1
 
-            for (id1, id2), new_id in self.merges.items():
-                if new_id < best_priority and (id1, id2) in zip(ids, ids[1:]):
-                    best_pair = (id1, id2)
-                    best_new_id = new_id
-                    best_priority = new_id
+            for i in range(len(ids) - 1):
+                pair = (ids[i], ids[i + 1])
+                if pair in self.merges:
+                    pri = self.merges[pair]
+                    if pri < best_pri:
+                        best_pri = pri
+                        best_pos = i
+                        best_new_id = pri
 
-            if best_pair is not None:
-                ids = _merge(ids, best_pair, best_new_id)
-                changed = True
+            if best_pos < 0:
+                break
+
+            # 原地替换而非 list copy
+            ids[best_pos] = best_new_id
+            del ids[best_pos + 1]
 
         return ids
+
+    def _encode_large(self, text: str) -> List[int]:
+        """大文本：按行分割后逐行编码"""
+        lines = text.split('\n')
+        all_ids = []
+        for line in lines:
+            if line:
+                all_ids.extend(self._encode_small(line))
+            all_ids.append(10)  # newline byte
+        if all_ids and all_ids[-1] == 10:
+            all_ids.pop()
+        return all_ids
 
     def decode(self, ids: List[int]) -> str:
         """将 token id 序列解码为文本
