@@ -1,45 +1,90 @@
 """
 llm.py — nanoGPT: 一个库化的 GPT 实现（Decoder-only Transformer）
 
-修复记录（v0.1 → v0.1.1）:
-  1. [BUG] 注意力缩放: C=n_embd → head_size（原 bug 导致 logits 低估 2 倍）
-  2. [STRUCT] 超参全局变量 → ModelConfig dataclass（解锁同进程多配置消融）
-  3. [DATA] 安全下载：不覆盖已有文件，带超时/重试/校验
-  4. [STRUCT] 添加 __main__ 保护（import 不触发训练）
-  5. [PERF] generate() 添加 KV cache + temperature/top_k/top_p 采样
-  6. [NAMING] FeedFoward → FeedForward + 残差投影 scaled init
-  7. [BUG] tril buffer 按实际 seqLen 截取 + BOS token 不再用 index 0
-  8. [OPT] AdamW 分组 weight decay（bias/norm 不加衰减）+ 梯度裁剪
-  9. [PERF] estimate_loss 减少 eval_iters、复用 model.eval() 状态
- 10. [ROBUST] arange 显式传 device（不再依赖全局变量）
- 11. [API] 支持可选 Dataset 注入 + 自定义 tokenizer
+修复记录（v0.1 → v0.1.1 → v0.5/M2）:
+  M1:
+    1. [BUG] 注意力缩放: C=n_embd → head_size（原 bug 导致 logits 低估 2 倍）
+    2. [STRUCT] 超参全局变量 → ModelConfig dataclass（解锁同进程多配置消融）
+    3. [DATA] 安全下载：不覆盖已有文件，带超时/重试/校验
+    4. [STRUCT] 添加 __main__ 保护（import 不触发训练）
+    5. [PERF] generate() 添加 KV cache + temperature/top_k/top_p 采样
+    6. [NAMING] FeedFoward → FeedForward + 残差投影 scaled init
+    7. [BUG] tril buffer 按实际 seqLen 截取 + BOS token 不再用 index 0
+    8. [OPT] AdamW 分组 weight decay（bias/norm 不加衰减）+ 梯度裁剪
+    9. [PERF] estimate_loss 减少 eval_iters、复用 model.eval() 状态
+   10. [ROBUST] arange 显式传 device（不再依赖全局变量）
+   11. [API] 支持可选 Dataset 注入 + 自定义 tokenizer
+  M2:
+   12. [PERF] SDPA: torch.nn.functional.scaled_dot_product_attention 可选切换
+   13. [PERF] 分块交叉熵：避免大 vocab × 长序列的 OOM
+   14. [FEAT] 全可复现 seed：torch/cuda/numpy/random/cudnn 全覆盖
+   15. [FEAT] 配置持久化：JSON 序列化/反序列化
+   16. [FEAT] 混合精度 + bf16 autocast（由 train.py Trainer 使用）
+   17. [FEAT] 检查点 save/load（由 train.py Trainer 使用）
+   18. [FEAT] 日志系统（由 train.py Trainer 使用）
 
 使用方式:
   # 作为库导入（不触发训练）
-  from llm import ModelConfig, GPTLanguageModel, Trainer
+  from llm import ModelConfig, GPTLanguageModel
 
   # 命令行训练
-  python llm.py --config tiny --iters 1000
+  python train.py --config mini --iters 2000
 
   # 消融实验
   cfg_a = ModelConfig(n_layer=4, n_head=4)
   cfg_b = ModelConfig(n_layer=6, n_head=6)
   model_a = GPTLanguageModel(cfg_a)
-  model_b = GPTLanguageModel(cfg_b)  # 同进程互不干扰
+  model_b = GPTLanguageModel(cfg_b)
 """
 
+import json
 import math
 import os
+import random
 import sys
 import time
 import urllib.request
 import urllib.error
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+
+# =====================================================================================
+# 0. 可复现性 — 完整 seed 设置
+# =====================================================================================
+
+def set_seed(seed: int, deterministic: bool = True):
+    """设置全局随机种子，确保可复现
+
+    Args:
+        seed: 随机种子
+        deterministic: 是否启用 cuDNN 确定性模式（True = 完全可复现但稍慢）
+    """
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    # numpy 是可选依赖，仅在已安装时设置
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        # 允许 cuDNN 寻找最优算法（更快但非完全确定性）
+        torch.backends.cudnn.benchmark = True
 
 
 # =====================================================================================
@@ -80,10 +125,24 @@ class ModelConfig:
     # 系统
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     seed: int = 42                 # 随机种子（可复现）
-
+    deterministic: bool = True     # cuDNN 确定性模式（完全可复现但稍慢）
+    
+    # M2: 训练工程化选项
+    use_sdpa: bool = True          # 使用 torch SDPA（更快+内存优化）
+    use_mixed_precision: bool = True  # bf16 混合精度训练
+    autocast_enabled: bool = True  # autocast 上下文管理器
+    grad_scaler_enabled: bool = True  # 梯度缩放器（防止 bf16 下溢）
+    ce_chunk_size: int = 0         # 分块 CE 块大小（0=不分块，用于大 vocab+长序列）
+    
+    # 日志/检查点
+    ckpt_dir: str = "checkpoints"  # 检查点保存目录
+    log_dir: str = "logs"          # 日志目录
+    ckpt_interval: int = 500       # 每 N 步保存检查点
+    resume_from: Optional[str] = None  # 恢复训练的检查点路径
+    
     # 数据
     data_url: str = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-    data_path: str = "input.txt"
+    data_path: str = "data/input.txt"
     download_timeout: int = 30     # 下载超时（秒）
     download_retries: int = 3      # 下载重试次数
 
@@ -100,7 +159,8 @@ class ModelConfig:
             self.n_kv_head = self.n_head  # 默认 MHA
         if self.n_head % self.n_kv_head != 0:
             raise ValueError(f"n_head ({self.n_head}) 必须被 n_kv_head ({self.n_kv_head}) 整除")
-        torch.manual_seed(self.seed)
+        # 使用完整 seed 设置
+        set_seed(self.seed, self.deterministic)
 
     @property
     def head_size(self) -> int:
@@ -111,14 +171,41 @@ class ModelConfig:
     def d_ff(self) -> int:
         """前馈网络中间维度（4 倍嵌入维度）"""
         return 4 * self.n_embd
+    
+    @property
+    def use_amp(self) -> bool:
+        """是否启用自动混合精度"""
+        return self.use_mixed_precision and self.device == 'cuda'
+    
+    @property
+    def supports_bf16(self) -> bool:
+        """检查当前 GPU 是否支持 bf16"""
+        if not torch.cuda.is_available():
+            return False
+        return torch.cuda.is_bf16_supported()
+
+    def save(self, path: str):
+        """保存配置到 JSON 文件"""
+        d = self.to_dict()
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(d, f, indent=2, ensure_ascii=False)
+    
+    @classmethod
+    def load(cls, path: str) -> 'ModelConfig':
+        """从 JSON 文件加载配置"""
+        with open(path, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        return cls(**d)
 
     def to_dict(self):
         """导出为 dict（用于日志/序列化）"""
-        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+        return asdict(self)
 
     def summary(self) -> str:
         """打印配置摘要"""
         params = self.estimate_params()
+        amp_str = f"bf16" if self.use_amp and self.supports_bf16 else "fp32"
         return (
             f"ModelConfig(\n"
             f"  n_layer={self.n_layer}, n_embd={self.n_embd}, n_head={self.n_head},\n"
@@ -126,6 +213,7 @@ class ModelConfig:
             f"  block_size={self.block_size}, vocab_size={self.vocab_size or 'TBD'},\n"
             f"  batch_size={self.batch_size}, max_iters={self.max_iters},\n"
             f"  learning_rate={self.learning_rate}, device='{self.device}',\n"
+            f"  sdpa={'ON' if self.use_sdpa else 'OFF'}, precision={amp_str},\n"
             f"  估计参数量={params/1e6:.2f}M\n"
             f")"
         )
@@ -309,16 +397,28 @@ class Head(nn.Module):
             k = k.repeat_interleave(heads_per_kv, dim=1)  # [B, n_head, T, head_size]
             v = v.repeat_interleave(heads_per_kv, dim=1)
 
-        # 注意力得分：wei = Q @ K^T / sqrt(head_size) — 修复原 bug: C -> head_size
-        wei = q @ k.transpose(-2, -1) * (head_size ** -0.5)  # [B, n_head, T, T]
+        if cfg.use_sdpa and hasattr(F, 'scaled_dot_product_attention'):
+            # SDPA: 自动选择最优实现（FlashAttention/Math/Memory-Efficient）
+            dropout_p = cfg.dropout if self.training else 0.0
+            # is_causal=True 时不需要手动 mask，且 FlashAttention 会自动处理
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=dropout_p,
+                is_causal=True,
+            )
+            out = out.transpose(1, 2).contiguous().view(B, T, n_head * head_size)
+        else:
+            # 手工实现（fallback）
+            # 注意力得分：wei = Q @ K^T / sqrt(head_size) — 修复原 bug: C -> head_size
+            wei = q @ k.transpose(-2, -1) * (head_size ** -0.5)  # [B, n_head, T, T]
 
-        # 因果掩码：截取前 T 行/列
-        wei = wei.masked_fill(self.tril[:T, :T].to(x.device) == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
+            # 因果掩码：截取前 T 行/列
+            wei = wei.masked_fill(self.tril[:T, :T].to(x.device) == 0, float('-inf'))
+            wei = F.softmax(wei, dim=-1)
+            wei = self.dropout(wei)
 
-        out = wei @ v  # [B, n_head, T, head_size]
-        out = out.transpose(1, 2).contiguous().view(B, T, n_head * head_size)
+            out = wei @ v  # [B, n_head, T, head_size]
+            out = out.transpose(1, 2).contiguous().view(B, T, n_head * head_size)
         return out
 
 
@@ -362,7 +462,65 @@ class Block(nn.Module):
 
 
 # =====================================================================================
-# 4. 完整 GPT 模型
+# 4. 分块交叉熵（M2：避免大 vocab × 长序列时 OOM）
+# =====================================================================================
+
+def cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor,
+                       chunk_size: int = 0, ignore_index: int = -100) -> torch.Tensor:
+    """分块交叉熵损失
+    
+    当 vocab_size × seq_len 很大时（如 32K × 4K），logits.view(-1, vocab_size) 
+    会分配巨量显存。此函数将序列分块处理，降低峰值显存。
+    
+    Args:
+        logits: [B, T, vocab_size] 模型输出
+        targets: [B, T] 目标 token ids
+        chunk_size: 每块处理的 token 数（0 = 不分块）
+        ignore_index: 忽略的 target 索引
+    
+    Returns:
+        loss 标量
+    """
+    if chunk_size <= 0:
+        # 不分块：标准 cross_entropy
+        return F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=ignore_index
+        )
+    
+    # 分块模式
+    B, T, V = logits.shape
+    logits_flat = logits.view(-1, V)      # [B*T, V]
+    targets_flat = targets.view(-1)        # [B*T]
+    total_loss = 0.0
+    total_tokens = 0
+    
+    for start in range(0, B * T, chunk_size):
+        end = min(start + chunk_size, B * T)
+        chunk_logits = logits_flat[start:end]
+        chunk_targets = targets_flat[start:end]
+        
+        # 计算有效 token 数（非 ignore_index）
+        mask = chunk_targets != ignore_index
+        n_valid = mask.sum().item()
+        if n_valid == 0:
+            continue
+        
+        chunk_loss = F.cross_entropy(
+            chunk_logits, chunk_targets,
+            ignore_index=ignore_index,
+            reduction='sum'
+        )
+        total_loss += chunk_loss.item()
+        total_tokens += n_valid
+    
+    return torch.tensor(total_loss / max(total_tokens, 1),
+                        device=logits.device, dtype=logits.dtype)
+
+
+# =====================================================================================
+# 5. 完整 GPT 模型
 # =====================================================================================
 
 class GPTLanguageModel(nn.Module):
@@ -435,14 +593,11 @@ class GPTLanguageModel(nn.Module):
         x = self.ln_f(x)
         logits = self.lm_head(x)  # [B, T, vocab_size]
 
-        # 计算损失
+        # 计算损失（使用分块 CE 避免 OOM）
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-100
-            )
+            loss = cross_entropy_loss(logits, targets,
+                                      chunk_size=self.config.ce_chunk_size)
 
         return logits, loss
 
@@ -523,227 +678,11 @@ class GPTLanguageModel(nn.Module):
 
 
 # =====================================================================================
-# 5. Trainer — 训练器（封装训练循环、评估、检查点）
+# 6. Trainer 和 CLI 入口已移至 train.py
 # =====================================================================================
-
-class Trainer:
-    """训练器：封装训练循环、评估、检查点
-
-    支持：
-    - 分组 weight decay（bias/RMSNorm 不加衰减）
-    - 梯度裁剪
-    - 学习率 warmup + cosine decay
-    - 周期评估 + 损失日志
-    """
-
-    def __init__(self, model: GPTLanguageModel, config: ModelConfig,
-                 train_data: torch.Tensor, val_data: torch.Tensor,
-                 decode_fn=None):
-        self.model = model.to(config.device)
-        self.config = config
-        self.train_data = train_data.to(config.device)
-        self.val_data = val_data.to(config.device)
-        self.decode_fn = decode_fn
-        self.optimizer = self._build_optimizer()
-        self.best_val_loss = float('inf')
-
-    def _build_optimizer(self) -> torch.optim.Optimizer:
-        """构建 AdamW 优化器（分组 weight decay）"""
-        cfg = self.config
-        # 分组：需要 weight decay 的参数（Linear weight, Embedding）
-        # 不需要 decay 的参数（bias, RMSNorm weight）
-        decay_params = []
-        no_decay_params = []
-
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if 'bias' in name or 'norm' in name or 'ln' in name:
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-        param_groups = [
-            {'params': decay_params, 'weight_decay': cfg.weight_decay},
-            {'params': no_decay_params, 'weight_decay': 0.0},
-        ]
-
-        return torch.optim.AdamW(
-            param_groups,
-            lr=cfg.learning_rate,
-            betas=(cfg.beta1, cfg.beta2),
-        )
-
-    def _get_lr(self, iter_num: int) -> float:
-        """学习率调度：warmup + cosine decay"""
-        cfg = self.config
-        warmup_iters = int(0.1 * cfg.max_iters)
-        if iter_num < warmup_iters:
-            return cfg.learning_rate * iter_num / warmup_iters
-        # cosine decay
-        decay_ratio = (iter_num - warmup_iters) / (cfg.max_iters - warmup_iters)
-        decay_ratio = min(decay_ratio, 1.0)
-        lr = cfg.learning_rate * 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        return lr
-
-    @torch.no_grad()
-    def estimate_loss(self) -> dict:
-        """估算训练集和验证集损失（优化：减少 eval_iters 默认值、状态恢复）"""
-        cfg = self.config
-        out = {}
-        self.model.eval()
-
-        for split in ['train', 'val']:
-            losses = torch.zeros(cfg.eval_iters)
-            for k in range(cfg.eval_iters):
-                X, Y = get_batch(split, self.train_data, self.val_data, cfg)
-                _, loss = self.model(X, Y)
-                losses[k] = loss.item()
-            out[split] = losses.mean()
-
-        self.model.train()
-        return out
-
-    def train(self, log_interval: int = 100):
-        """运行完整训练循环
-
-        Args:
-            log_interval: 日志打印间隔（步数）
-        """
-        cfg = self.config
-        print(f"[train] 开始训练: {cfg.max_iters} 步")
-        print(f"[train] 参数量: {self.model.count_params() / 1e6:.2f}M")
-
-        for iter_num in range(cfg.max_iters):
-            # 更新学习率
-            lr = self._get_lr(iter_num)
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = lr
-
-            # 周期评估
-            if iter_num % cfg.eval_interval == 0:
-                losses = self.estimate_loss()
-                val_flag = "↓" if losses['val'] < self.best_val_loss else "="
-                self.best_val_loss = min(self.best_val_loss, losses['val'])
-                print(f"step {iter_num:5d}: train {losses['train']:.4f}, "
-                      f"val {losses['val']:.4f} {val_flag}, lr {lr:.2e}")
-
-            # 前向 + 反向
-            xb, yb = get_batch('train', self.train_data, self.val_data, cfg)
-            logits, loss = self.model(xb, yb)
-
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-
-            # 梯度裁剪（分组后全局裁剪）
-            if cfg.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), cfg.grad_clip
-                )
-
-            self.optimizer.step()
-
-        print("[train] 训练完成！")
-        return self.model
-
-
-# =====================================================================================
-# 6. CLI 入口 — 仅在直接运行时执行训练（import 安全）
-# =====================================================================================
-
-def main():
-    """CLI 训练入口"""
-    import argparse
-
-    parser = argparse.ArgumentParser(description="nanoGPT — 字符级 GPT 训练")
-    parser.add_argument('--config', type=str, default='default',
-                        choices=['tiny', 'mini', 'small', 'default'],
-                        help='预设配置')
-    parser.add_argument('--iters', type=int, default=None,
-                        help='覆盖 max_iters')
-    parser.add_argument('--data', type=str, default=None,
-                        help='本地数据文件路径（跳过下载）')
-    parser.add_argument('--lr', type=float, default=None)
-    parser.add_argument('--device', type=str, default=None)
-    # 消融参数
-    parser.add_argument('--n-layer', type=int, default=None)
-    parser.add_argument('--n-embd', type=int, default=None)
-    parser.add_argument('--n-head', type=int, default=None)
-    parser.add_argument('--block-size', type=int, default=None)
-    args = parser.parse_args()
-
-    # 预设配置
-    presets = {
-        'tiny': ModelConfig(n_layer=2, n_embd=64, n_head=4, block_size=32,
-                            batch_size=8, max_iters=500, eval_interval=100),
-        'mini': ModelConfig(n_layer=4, n_embd=128, n_head=4, block_size=64,
-                            batch_size=16, max_iters=2000, eval_interval=200),
-        'small': ModelConfig(n_layer=6, n_embd=384, n_head=6, block_size=128,
-                             batch_size=24, max_iters=5000, eval_interval=500),
-    }
-
-    if args.config == 'default':
-        config = ModelConfig()
-    else:
-        config = presets[args.config]
-
-    # CLI 覆盖
-    if args.iters is not None:
-        config.max_iters = args.iters
-    if args.data is not None:
-        config.data_path = args.data
-    if args.lr is not None:
-        config.learning_rate = args.lr
-    if args.device is not None:
-        config.device = args.device
-    if args.n_layer is not None:
-        config.n_layer = args.n_layer
-    if args.n_embd is not None:
-        config.n_embd = args.n_embd
-    if args.n_head is not None:
-        config.n_head = args.n_head
-    if args.block_size is not None:
-        config.block_size = args.block_size
-
-    print(f"{'='*60}")
-    print(f" nanoGPT v0.1.1 — 库化修复版")
-    print(f"{'='*60}")
-    print(config.summary())
-
-    # 加载数据
-    train_data, val_data, vocab_size = load_and_tokenize(config)
-    config.vocab_size = vocab_size
-    print(f"[data] 词表大小: {vocab_size}，训练集: {len(train_data):,} 字符，"
-          f"验证集: {len(val_data):,} 字符")
-
-    # 构建模型
-    model = GPTLanguageModel(config)
-    print(f"[model] 实际参数量: {model.count_params() / 1e6:.2f}M")
-
-    # 构建 Trainer
-    encode_fn, decode_fn, _ = build_tokenizer(
-        open(config.data_path, 'r', encoding='utf-8').read()
-    )
-    trainer = Trainer(model, config, train_data, val_data, decode_fn=decode_fn)
-
-    # 训练
-    trainer.train()
-
-    # 生成示例
-    print(f"\n{'='*60}")
-    print(" 生成文本示例")
-    print(f"{'='*60}")
-    # 使用词表中的高频字符作为起始（不再用 index 0）
-    start_text = "The"
-    start_ids = torch.tensor([encode_fn(start_text)], dtype=torch.long,
-                             device=config.device)
-    model.eval()
-    with torch.no_grad():
-        generated = model.generate(start_ids, max_new_tokens=500,
-                                    temperature=0.8, top_k=40)
-    print(decode_fn(generated[0].tolist()))
-    print(f"{'='*60}")
-
-
-if __name__ == '__main__':
-    main()
+# train.py 包含：
+#   - 增强版 Trainer（混合精度、检查点、日志）
+#   - CheckpointManager
+#   - CLI 命令行入口
+#
+# llm.py 仅保留：ModelConfig, 数据加载, 模型定义（作为库层）

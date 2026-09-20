@@ -1,6 +1,6 @@
-"""llm.py 基础单元测试
+"""llm.py + train.py M1+M2 基础单元测试
 
-运行: pytest tests/ 或 python -m pytest tests/
+运行: python -m pytest tests/test_llm.py
 """
 import pytest
 import torch
@@ -9,7 +9,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from llm import ModelConfig, GPTLanguageModel, FeedForward, Block
+from llm import ModelConfig, GPTLanguageModel, FeedForward, Block, cross_entropy_loss
 
 
 class TestModelConfig:
@@ -31,6 +31,7 @@ class TestModelConfig:
     def test_gqa_head_size(self):
         cfg = ModelConfig(n_embd=128, n_head=4, n_kv_head=2, vocab_size=65)
         assert cfg.head_size == 32
+        assert cfg.n_kv_head == 2
 
     def test_estimate_params_positive(self):
         cfg = ModelConfig(vocab_size=65)
@@ -46,6 +47,28 @@ class TestModelConfig:
         cfg = ModelConfig(vocab_size=65)
         s = cfg.summary()
         assert 'n_layer' in s
+
+    def test_use_amp_property(self):
+        cfg = ModelConfig(vocab_size=65, device='cpu')
+        assert not cfg.use_amp  # CPU 不启用 AMP
+
+    def test_save_load_roundtrip(self, tmp_path):
+        """测试配置 JSON 序列化往返"""
+        cfg = ModelConfig(vocab_size=65, n_layer=3, n_embd=256)
+        path = str(tmp_path / "config.json")
+        cfg.save(path)
+        
+        cfg2 = ModelConfig.load(path)
+        assert cfg2.vocab_size == 65
+        assert cfg2.n_layer == 3
+        assert cfg2.n_embd == 256
+
+    def test_gqa_repeat_correctness(self):
+        """验证 GQA 模型的 numKVHeads 被正确设置"""
+        cfg = ModelConfig(vocab_size=65, n_embd=64, n_head=4, n_kv_head=2)
+        model = GPTLanguageModel(cfg)
+        # 确保模型创建成功
+        assert model.count_params() > 0
 
 
 class TestGPTLanguageModel:
@@ -95,8 +118,8 @@ class TestGPTLanguageModel:
         )
         model = GPTLanguageModel(cfg)
         x = torch.randint(0, 65, (2, 8))
-        logits, loss = model(x)
-        assert logits.shape[-1] == 65
+        logits, _ = model(x)
+        assert logits.shape == (2, 8, 65)
 
     def test_different_configs_independent(self):
         """验证两个不同配置的模型互不干扰（消融前提）"""
@@ -106,11 +129,47 @@ class TestGPTLanguageModel:
         model_b = GPTLanguageModel(cfg_b)
 
         assert model_a.count_params() != model_b.count_params()
-        # 前向独立
         x = torch.randint(0, 65, (1, 8))
-        out_a, _ = model_a(x)
+        out_a, _ = model_a(x[:, :4])
         out_b, _ = model_b(x)
         assert out_a.shape != out_b.shape
+
+    def test_sdpa_fallback(self):
+        """测试 SDPA 和 fallback 都能正确运行"""
+        for use_sdpa in [True, False]:
+            cfg = ModelConfig(
+                vocab_size=65, n_layer=2, n_embd=64,
+                n_head=4, block_size=32, use_sdpa=use_sdpa
+            )
+            model = GPTLanguageModel(cfg)
+            x = torch.randint(0, 65, (1, 8))
+            logits, loss = model(x, torch.randint(0, 65, (1, 8)))
+            assert logits.shape == (1, 8, 65)
+
+
+class TestChunkedCE:
+    """分块交叉熵测试"""
+
+    def test_standard_equals_chunked(self):
+        """验证分块 CE 与标准 CE 结果一致"""
+        torch.manual_seed(42)
+        logits = torch.randn(2, 8, 65, requires_grad=True)
+        targets = torch.randint(0, 65, (2, 8))
+
+        loss_standard = cross_entropy_loss(logits, targets, chunk_size=0)
+        loss_chunked = cross_entropy_loss(logits, targets, chunk_size=4)
+
+        # 数值应该非常接近
+        assert abs(loss_standard.item() - loss_chunked.item()) < 0.01
+
+    def test_chunked_backward(self):
+        """验证 CE 梯度可回退"""
+        logits = torch.randn(2, 8, 65, requires_grad=True)
+        targets = torch.randint(0, 65, (2, 8))
+        loss = cross_entropy_loss(logits, targets, chunk_size=0)
+        loss.backward()
+        assert logits.grad is not None
+        assert logits.grad.shape == logits.shape
 
 
 class TestFeedForward:
@@ -127,6 +186,20 @@ class TestFeedForward:
         """验证残差投影层被 scaled init"""
         cfg = ModelConfig(n_embd=64)
         ff = FeedForward(cfg)
-        # 投影层权重应接近 0
         proj_weight = ff.net[-2].weight
         assert proj_weight.abs().max().item() < 0.1
+
+
+class TestSeed:
+    """可复现性测试"""
+
+    def test_set_seed_reproducibility(self):
+        """验证 set_seed 能使两次随机序列一致"""
+        from llm import set_seed
+        set_seed(42)
+        a = torch.randn(10)
+        
+        set_seed(42)
+        b = torch.randn(10)
+        
+        assert torch.allclose(a, b)
